@@ -1,0 +1,39 @@
+# Minimal one-URL CTF solver configuration.
+# Environment variables MODEL_BASE_URL / MODEL_API_KEY / MODEL_ID override these values.
+model:
+  baseUrl: http://127.0.0.1:30000/v1
+  apiKey: duckgpt
+  id: duckgpt
+  contextWindow: 102400
+  maxTokens: 8192
+  temperature: 0.8
+  topP: 0.95
+
+agent:
+  classifyBudget: 128
+  planBudget: 128
+  methodBudget: 128
+  maxMethods: 5
+  compactTokens: 64000
+  useOfficialCompactionApi: false
+  httpTimeoutSeconds: 60
+  modelTimeoutSeconds: 900
+  maxResponseBytes: 65536
+  maxToolCaptureBytes: 262144
+  maxInlineToolResultBytes: 2048
+  maxToolReadBytes: 32768
+  maxToolResultBytes: 40960
+  maxToolArgumentBytes: 16384
+  maxToolBuffers: 16
+  toolResultIdleRounds: 4
+  maxNativeCallsPerTurn: 8
+  maxTuiChars: 24000
+  pythonTimeoutSeconds: 60
+  maxPythonTimeoutSeconds: 600
+  # Per-task workspace root, created below the process's current directory.
+  # Python runs in its session subdirectory; files persist across stages.
+  virtualWorkspaceDir: virtual_files
+  maxVirtualFileBytes: 8388608
+  maxVirtualFileReadBytes: 32768
+  maxVirtualFileWriteBytes: 32768
+  maxVirtualFiles: 128
