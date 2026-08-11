@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import uuid
 from typing import Any
 from urllib.parse import urlparse
@@ -27,6 +27,35 @@ from urllib.parse import urlparse
 import requests
 from ctf_tui import TerminalTui
 import yaml
+PYTHON_WORKSPACE_RUNNER = """from pathlib import Path, PurePosixPath
+import os
+import sys
+
+VFS_ROOT = Path(os.environ["CTF_AGENT_WORKSPACE"]).resolve()
+
+
+def vfs(path):
+    if not isinstance(path, str):
+        raise TypeError("vfs path must be a string")
+    if "\\\\" in path or not path.startswith("/") or path.startswith("//"):
+        raise ValueError("vfs paths must use one leading '/' and POSIX '/' separators")
+    parts = PurePosixPath(path).parts[1:]
+    if any(part in {"", ".", ".."} or ":" in part for part in parts):
+        raise ValueError("vfs path must not contain traversal or drive syntax")
+    candidate = VFS_ROOT.joinpath(*parts).resolve()
+    candidate.relative_to(VFS_ROOT)
+    return candidate
+
+
+os.chdir(VFS_ROOT)
+source_path = Path(sys.argv[1])
+source_name = sys.argv[2]
+source = source_path.read_text(encoding="utf-8")
+sys.argv[:] = [source_name]
+namespace = {"__name__": "__main__", "__file__": source_name, "vfs": vfs, "VFS_ROOT": VFS_ROOT}
+exec(compile(source, source_name, "exec"), namespace, namespace)
+"""
+
 
 
 # ---------------------------------------------------------------- display ---
@@ -165,6 +194,7 @@ RESPONSE_TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
                 "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]},
                 "headers": {"type": "object", "maxProperties": 64, "additionalProperties": {"type": "string", "maxLength": 2048}},
                 "body": {"type": "string", "maxLength": 16384, "description": "Optional request body."},
+                "body_path": {"type": "string", "maxLength": 512, "description": "Optional virtual absolute path such as /payload.bin; sends that file's raw bytes as the request body."},
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -173,31 +203,31 @@ RESPONSE_TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
     "python": {
         "type": "function",
         "name": "python",
-        "description": "Run an isolated Python 3 analysis script for authorized CTF work. Large output is hidden in a temporary result buffer; inspect it with read_tool_result. timeout_seconds defaults to the configured Python timeout and may be raised up to the configured maximum.",
+        "description": "Run an isolated Python 3 analysis script in the same persistent virtual workspace as write_file/read_file. Provide exactly one of code or path. path executes a saved UTF-8 script at a virtual absolute path such as /scripts/check.py. Inline code can use vfs('/data.txt') for a virtual-root path; relative paths resolve from virtual /. Large output is hidden in a temporary result buffer; inspect it with read_tool_result. timeout_seconds defaults to the configured Python timeout and may be raised up to the configured maximum.",
         "parameters": {
             "type": "object",
             "properties": {
                 "code": {"type": "string", "maxLength": 16384, "description": "Python 3 source code."},
+                "path": {"type": "string", "maxLength": 512, "description": "Virtual absolute UTF-8 script path such as /scripts/check.py."},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Optional bounded execution timeout; defaults to 60 seconds and is capped by the operator configuration."},
             },
-            "required": ["code"],
             "additionalProperties": False,
         },
     },
     "list_files": {
         "type": "function",
         "name": "list_files",
-        "description": "List files in the current task's virtual workspace. Paths are relative to the virtual workspace.",
+        "description": "List files in the current task's virtual workspace. The workspace root is / and every returned path starts with /.",
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     "read_file": {
         "type": "function",
         "name": "read_file",
-        "description": "Read a UTF-8 byte range from a virtual-workspace file. Set limit to 0 or omit it to read the remaining bytes up to the page cap.",
+        "description": "Read a UTF-8 byte range from a virtual-workspace file rooted at /. Set limit to 0 or omit it to read up to the page cap.",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Relative virtual-workspace path."},
+                "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Virtual absolute path such as /notes/data.txt."},
                 "offset": {"type": "integer", "minimum": 0, "description": "Zero-based byte offset."},
                 "limit": {"type": "integer", "minimum": 0, "maximum": 32768, "description": "Bytes to read; 0 or omitted means the largest allowed page."},
             },
@@ -208,11 +238,11 @@ RESPONSE_TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
     "write_file": {
         "type": "function",
         "name": "write_file",
-        "description": "Create or overwrite a UTF-8 file in the virtual workspace, or append when append is true.",
+        "description": "Create or overwrite a valid UTF-8 file in the virtual workspace rooted at /, or append when append is true.",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Relative virtual-workspace path."},
+                "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Virtual absolute path such as /scripts/check.py."},
                 "content": {"type": "string", "maxLength": 32768, "description": "UTF-8 text to write."},
                 "append": {"type": "boolean", "description": "Append instead of overwrite; defaults to false."},
             },
@@ -227,7 +257,7 @@ RESPONSE_TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Relative virtual-workspace path."},
+                "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Virtual absolute path such as /scripts/check.py."},
                 "offset": {"type": "integer", "minimum": 0, "description": "Range-mode byte offset."},
                 "limit": {"type": "integer", "minimum": 0, "maximum": 32768, "description": "Range-mode bytes to replace; 0 inserts at offset."},
                 "replacement": {"type": "string", "maxLength": 32768, "description": "Range-mode replacement text."},
@@ -243,12 +273,12 @@ RESPONSE_TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
     "download_file": {
         "type": "function",
         "name": "download_file",
-        "description": "Download an authorized target-origin URL into a virtual-workspace file without placing its content in model context.",
+        "description": "Download an authorized target-origin URL into a virtual-workspace file rooted at / without placing its content in model context.",
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Absolute URL on the authorized target origin."},
-                "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Relative virtual-workspace destination path."},
+                "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Virtual absolute destination path such as /downloads/page.html."},
                 "headers": {"type": "object", "maxProperties": 64, "additionalProperties": {"type": "string", "maxLength": 2048}},
                 "overwrite": {"type": "boolean", "description": "Replace an existing file; defaults to false."},
             },
@@ -371,6 +401,9 @@ def load_config(path: str) -> dict[str, Any]:
     agent.setdefault("methodBudget", 128)    # independent budget for each candidate method
     agent.setdefault("maxMethods", 5)         # candidate methods to test
     agent.setdefault("compactTokens", 64000)  # hard per-stage context budget; compact after actual usage reaches it
+    agent.setdefault("maxCompactionInputTokens", 8192)
+    agent.setdefault("maxSummaryInputTokens", 12000)
+    agent.setdefault("maxMethodSummaryChars", 600)
     agent.setdefault("useOfficialCompactionApi", False)
     agent.setdefault("httpTimeoutSeconds", 60)
     agent.setdefault("maxResponseBytes", 65536)  # legacy inline response cap
@@ -471,6 +504,11 @@ class CtfAgent:
         self.tool_buffer_sequence = 0
         self.tool_round = 0
         self.last_official_compaction_id: str | None = None
+        self.last_official_compaction_output: list[dict[str, Any]] = []
+        self.last_official_compaction_encrypted_content = ""
+        self.compaction_groups: list[list[dict[str, Any]]] = []
+        self.current_compaction_group: list[dict[str, Any]] | None = None
+        self.last_compaction_input_truncated = False
         self.current_stage_title = "准备"
         self.stage_budget = 0
         self.stage_remaining = 0
@@ -532,19 +570,25 @@ class CtfAgent:
 
     def virtual_path(self, raw_path: Any) -> Path:
         if not isinstance(raw_path, str) or not raw_path.strip():
-            raise ValueError("path must be a non-empty relative virtual-workspace path")
-        requested = Path(raw_path)
-        if requested.is_absolute():
-            raise ValueError("absolute paths are not allowed in the virtual workspace")
-        resolved = (self.workspace / requested).resolve()
+            raise ValueError("path must be a non-empty virtual path rooted at '/'")
+        raw = raw_path.strip()
+        if "\\" in raw or not raw.startswith("/") or raw.startswith("//"):
+            raise ValueError("virtual paths must use one leading '/' and POSIX '/' separators")
+        try:
+            parts = PurePosixPath(raw).parts[1:]
+        except UnicodeError as error:
+            raise ValueError("path must be valid UTF-8 text") from error
+        if not parts or any(part in {"", ".", ".."} or ":" in part for part in parts):
+            raise ValueError("virtual path must name a file below '/' without traversal or drive syntax")
+        resolved = (self.workspace.joinpath(*parts)).resolve()
         try:
             resolved.relative_to(self.workspace)
-        except ValueError as error:
+        except (OSError, ValueError) as error:
             raise ValueError("path escapes the virtual workspace") from error
         return resolved
 
     def virtual_relative_path(self, path: Path) -> str:
-        return path.relative_to(self.workspace).as_posix()
+        return "/" + path.relative_to(self.workspace).as_posix()
 
     @staticmethod
     def _origin(url: str) -> str:
@@ -590,6 +634,14 @@ class CtfAgent:
     @staticmethod
     def _decode_result_bytes(content: bytes) -> str:
         return content.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _encode_utf8_text(value: str, field_name: str) -> bytes:
+        try:
+            return value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError(f"{field_name} must be valid UTF-8 text") from error
+
 
     def store_tool_content(self, content: bytes, source_bytes: int | None = None, truncated: bool = False) -> dict[str, Any]:
         capture_limit = max(1, int(self.settings["maxToolCaptureBytes"]))
@@ -659,12 +711,12 @@ class CtfAgent:
             "content": self._decode_result_bytes(stored.content[start:end]),
         }
 
-    def build_prompt(self, task: str) -> str:
+    def build_prompt(self, task: str, *, include_history: bool = True) -> str:
         parts = [
             "Authorized target URL: " + self.target_url,
             "Only URLs on this exact origin are authorized.",
             f"One model response may invoke multiple native functions. They execute sequentially in source order and each consumes stage action budget; the API is asked for at most {max(1, int(self.settings.get('maxNativeCallsPerTurn', 8)))} calls per response. Large curl/python results are returned as a small preview plus result_id; use read_tool_result(result_id, offset, limit) to page through the temporary buffer. Use limit 0 to read the remaining bytes up to the page cap. A buffer expires after several turns without being read.",
-            "Python's current directory and list_files/read_file/write_file/edit_file/download_file share one persistent virtual workspace for this task. Use relative paths only; never use /tmp or an absolute path. write_file creates or replaces UTF-8 text, read_file pages by byte offset and limit, download_file saves an authorized target-origin response without injecting its content, and edit_file supports exact find/replace or guarded offset+limit replacement.",
+            "All task files live in one persistent virtual filesystem rooted at '/'. Every native file path must be an absolute virtual POSIX path such as /scripts/check.py; it never names the host filesystem. write_file/read_file/edit_file/download_file, curl.body_path, and python.path use this same contract. Python starts at virtual /, so relative paths resolve there; use vfs('/path') inside inline or saved Python code when an explicit virtual-root path is needed. Text files and Python scripts are UTF-8.",
             "Python has standard-library urllib and SSL support. Do not claim an environment limitation without returning the actual stderr; if an authorized HTTPS request fails, inspect that error before choosing another tool.",
         ]
         if self.description:
@@ -673,9 +725,32 @@ class CtfAgent:
         if knowledge:
             parts += ["\n## Carried-over conclusions", knowledge]
         parts += ["\nStage task: " + task]
-        if self.history:
+        if include_history and self.history:
             parts += ["\nStage history:\n" + "\n".join(self.history)]
         return "\n".join(parts)
+
+    def prior_method_outcome_lines(self, before_index: int | None = None) -> list[str]:
+        methods = self.globals["methods"]
+        if before_index is None:
+            before_index = self.current_method or len(methods) + 1
+        summary_limit = max(160, int(self.settings.get("maxMethodSummaryChars", 600)))
+        outcomes: list[str] = []
+        for index, method in enumerate(methods, 1):
+            if index >= before_index:
+                break
+            status = str(method.get("status", ""))
+            summary = " ".join(str(method.get("summary", "")).split())[:summary_limit]
+            if status in {"failed", "exhausted"} and summary:
+                outcomes.append(f"{index}. [{status}] {str(method.get('name', ''))[:160]} — {summary}")
+        return outcomes
+
+    def show_prior_method_outcomes(self, before_index: int) -> None:
+        outcomes = self.prior_method_outcome_lines(before_index)
+        if not outcomes:
+            return
+        emit("📒 前序执行失败总结（已注入当前阶段上下文，禁止重复相同路径）：", "info")
+        for outcome in outcomes:
+            emit("   " + outcome, "dim")
 
     def knowledge_block(self) -> str:
         lines = []
@@ -685,14 +760,12 @@ class CtfAgent:
         if methods:
             lines.append("Candidate methods and their status:")
             for index, method in enumerate(methods, 1):
-                if index == self.current_method:
-                    mark = "CURRENT — test only this one"
-                else:
-                    mark = method["status"]
-                line = f"  {index}. [{mark}] {method['name']}"
-                if method.get("summary"):
-                    line += f" — {method['summary']}"
-                lines.append(line)
+                mark = "CURRENT — test only this one" if index == self.current_method else method["status"]
+                lines.append(f"  {index}. [{mark}] {method['name']}")
+            outcomes = self.prior_method_outcome_lines()
+            if outcomes:
+                lines.append("Prior execution outcome handoffs (DO NOT repeat these failed paths):")
+                lines.extend("  " + outcome for outcome in outcomes)
         if self.globals["findings"]:
             lines.append("Stage digests:")
             lines.extend("- " + finding for finding in self.globals["findings"])
@@ -899,13 +972,38 @@ class CtfAgent:
             input_tokens=input_tokens,
         )
 
+    def summary_input_token_budget(self) -> int:
+        configured = max(256, int(self.settings.get("maxSummaryInputTokens", 12000)))
+        try:
+            context_window = max(1024, int(self.model.get("contextWindow", 102400)))
+        except (TypeError, ValueError):
+            context_window = 102400
+        reserve = max(1024, min(4096, context_window // 4))
+        return min(configured, max(256, context_window - reserve - 512))
+
+    def bounded_summary_transcript(self, transcript: str) -> str:
+        token_budget = self.summary_input_token_budget()
+        byte_budget = token_budget * 3
+        encoded = transcript.encode("utf-8")
+        if len(encoded) <= byte_budget:
+            return transcript
+        marker = (
+            f"[Earlier tool transcript truncated to fit the {token_budget}-token summary budget; "
+            "only the newest retained evidence follows.]\n"
+        ).encode("utf-8")
+        tail_bytes = max(0, byte_budget - len(marker))
+        tail = b"" if tail_bytes == 0 else encoded[-tail_bytes:]
+        return marker.decode("utf-8") + tail.decode("utf-8", errors="ignore")
+
     def summarize(self, transcript: str, what: str) -> str:
-        """Compress one task transcript through an independent short Responses request."""
-        context_limit = int(self.settings["compactTokens"])
+        """Summarize bounded stage evidence through an independent model request."""
+        bounded_transcript = self.bounded_summary_transcript(transcript)
+        bounded_what = " ".join(str(what).split())[:600]
         prompt = (
-            f"Summarize this authorized Web CTF stage transcript in under 120 words: {what}. "
-            "Keep concrete endpoints, parameters, payloads tried, and observed responses. Plain text only.\n\n"
-            + transcript[-max(12000, context_limit * 2):]
+            f"Summarize this authorized Web CTF stage transcript in under 120 words: {bounded_what}. "
+            "Keep only verified endpoints, parameters, payloads tried, observed responses, and explicit failure causes. "
+            "Do not invent facts. Plain text only.\n\n"
+            + bounded_transcript
         )
         try:
             turn = self.completion(prompt, max_tokens=512)
@@ -914,14 +1012,281 @@ class CtfAgent:
         summary = turn.text or turn.reasoning
         return " ".join(summary.split())[:600]
 
-    def compact_with_official_api(self, previous_response_id: str | None) -> str:
-        """Request an opaque OpenAI Responses compaction artifact without using its id as a continuation id."""
+    @staticmethod
+    def _compact_content_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    value = part.get("text", part.get("content", ""))
+                    if value:
+                        parts.append(str(value))
+                elif part:
+                    parts.append(str(part))
+            return "".join(parts)
+        return str(content or "")
+
+    def _normalize_compaction_input(self, input_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for item in input_data:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type == "function_call_output":
+                normalized.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(item.get("call_id") or ""),
+                        "output": str(item.get("output") or ""),
+                    }
+                )
+            elif item_type == "function_call":
+                normalized.append(
+                    {
+                        "type": "function_call",
+                        "call_id": str(item.get("call_id") or ""),
+                        "name": str(item.get("name") or ""),
+                        "arguments": str(item.get("arguments") or ""),
+                    }
+                )
+            elif item_type in {"compaction", "reasoning"}:
+                encrypted_content = item.get("encrypted_content")
+                item_id = item.get("id")
+                if not isinstance(encrypted_content, str) or not encrypted_content or not item_id:
+                    continue
+                summary = item.get("summary") if isinstance(item.get("summary"), list) else []
+                normalized.append(
+                    {
+                        "type": "reasoning",
+                        "id": str(item_id),
+                        "summary": summary,
+                        "encrypted_content": encrypted_content,
+                    }
+                )
+            elif item_type == "message" or item.get("role"):
+                normalized.append(
+                    {
+                        "type": "message",
+                        "role": str(item.get("role") or "user"),
+                        "content": self._compact_content_text(item.get("content", "")),
+                    }
+                )
+        return normalized
+
+    @staticmethod
+    def _prepare_official_compaction_output(output: list[Any]) -> list[dict[str, Any]]:
+        # QWEN-EXO rejects type=compaction on the next /responses input; its
+        # accepted opaque-state carrier is the Responses reasoning item shape.
+        prepared: list[dict[str, Any]] = []
+        found_compaction = False
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "compaction":
+                item_id = item.get("id")
+                encrypted_content = item.get("encrypted_content")
+                if not item_id or not isinstance(encrypted_content, str) or not encrypted_content:
+                    continue
+                found_compaction = True
+                prepared.append(
+                    {
+                        "type": "reasoning",
+                        "id": str(item_id),
+                        "summary": item.get("summary") if isinstance(item.get("summary"), list) else [],
+                        "encrypted_content": encrypted_content,
+                    }
+                )
+            else:
+                prepared.append(dict(item))
+        if not found_compaction:
+            raise RuntimeError("Official compaction response lacked an opaque compaction artifact")
+        return prepared
+
+    def begin_compaction_input(self, input_data: list[dict[str, Any]]) -> None:
+        items = self._normalize_compaction_input(input_data)
+        if items:
+            self.compaction_groups.append(items)
+            self.current_compaction_group = None
+
+    def append_compaction_response(self, turn: ResponseTurn) -> None:
+        items: list[dict[str, Any]] = []
+        if turn.text:
+            items.append({"type": "message", "role": "assistant", "content": turn.text})
+        for call in turn.function_calls:
+            if not call.call_id:
+                continue
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }
+            )
+        if items:
+            self.compaction_groups.append(items)
+            self.current_compaction_group = items
+        else:
+            self.current_compaction_group = None
+
+    def append_compaction_output(self, call_id: str, output: str) -> None:
+        if not call_id:
+            return
+        if self.current_compaction_group is None:
+            self.current_compaction_group = []
+            self.compaction_groups.append(self.current_compaction_group)
+        self.current_compaction_group.append(
+            {"type": "function_call_output", "call_id": call_id, "output": output}
+        )
+
+    @staticmethod
+    def _compaction_group_is_complete(group: list[dict[str, Any]]) -> bool:
+        pending: set[str] = set()
+        for item in group:
+            item_type = item.get("type")
+            if item_type == "function_call":
+                call_id = str(item.get("call_id") or "")
+                if not call_id or call_id in pending:
+                    return False
+                pending.add(call_id)
+            elif item_type == "function_call_output":
+                call_id = str(item.get("call_id") or "")
+                if not call_id or call_id not in pending:
+                    return False
+                pending.remove(call_id)
+        return not pending
+
+
+    @staticmethod
+    def _json_size(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    def _compaction_input_token_budget(self) -> int:
+        configured = max(1024, int(self.settings.get("maxCompactionInputTokens", 8192)))
+        try:
+            context_window = max(2048, int(self.model.get("contextWindow", 102400)))
+        except (TypeError, ValueError):
+            context_window = 102400
+        reserve = max(2048, min(8192, context_window // 4))
+        return min(configured, max(1024, context_window - reserve - 1024))
+
+    def _truncate_compaction_group(
+        self,
+        group: list[dict[str, Any]],
+        byte_budget: int,
+    ) -> list[dict[str, Any]] | None:
+        if byte_budget <= 0 or not group or not self._compaction_group_is_complete(group):
+            return None
+        candidate = [dict(item) for item in group]
+        current_size = self._json_size(candidate)
+        if current_size <= byte_budget:
+            return candidate
+        marker = "[tool content truncated for compaction]\n"
+        while current_size > byte_budget:
+            choices: list[tuple[int, int, str]] = []
+            for index, item in enumerate(candidate):
+                for key in ("output", "content"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value:
+                        choices.append((len(value.encode("utf-8")), index, key))
+            if not choices:
+                return None
+            _, index, key = max(choices)
+            original = str(candidate[index][key])
+            body = original[len(marker):] if original.startswith(marker) else original
+            body_bytes = body.encode("utf-8")
+            reduction = max(1, current_size - byte_budget, len(body_bytes) // 2)
+            target_bytes = max(0, len(body_bytes) - reduction)
+            if target_bytes:
+                tail = body_bytes[-target_bytes:].decode("utf-8", errors="ignore")
+                replacement = marker + tail
+            else:
+                replacement = marker
+            if replacement == original:
+                replacement = ""
+            candidate[index][key] = replacement
+            new_size = self._json_size(candidate)
+            if new_size >= current_size:
+                candidate[index][key] = ""
+                new_size = self._json_size(candidate)
+                if new_size >= current_size:
+                    return None
+            current_size = new_size
+        return candidate
+
+    def bounded_compaction_input(self) -> tuple[list[dict[str, Any]], bool]:
+        token_budget = self._compaction_input_token_budget()
+        byte_budget = token_budget * 3
+        groups = [
+            [dict(item) for item in group]
+            for group in self.compaction_groups
+            if self._compaction_group_is_complete(group)
+        ]
+        full = [item for group in groups for item in group]
+        if len(groups) == len(self.compaction_groups) and self._json_size(full) <= byte_budget:
+            return full, False
+
+        marker = {
+            "type": "message",
+            "role": "user",
+            "content": f"[older Responses/tool history truncated to fit the {token_budget}-token compaction budget]",
+        }
+        while self._json_size([marker]) > byte_budget and marker["content"]:
+            marker["content"] = str(marker["content"])[:-1]
+        prefix_items: list[dict[str, Any]] = []
+        marker_size = self._json_size([marker])
+        if groups and marker_size < byte_budget:
+            first_budget = min(max(256, byte_budget // 4), byte_budget - marker_size)
+            first = self._truncate_compaction_group(groups[0], first_budget)
+            if first and self._json_size(first + [marker]) <= byte_budget:
+                prefix_items = first
+        prefix = prefix_items + [marker]
+
+        def flatten(selected: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+            return [item for group in selected for item in group]
+
+        tail_groups: list[list[dict[str, Any]]] = []
+        for group in reversed(groups[1:]):
+            current = prefix + flatten(tail_groups)
+            remaining = byte_budget - self._json_size(current)
+            if remaining <= 0:
+                break
+            fitted = self._truncate_compaction_group(group, remaining)
+            if fitted is None:
+                continue
+            candidate = prefix + flatten([fitted] + tail_groups)
+            if self._json_size(candidate) <= byte_budget:
+                tail_groups.insert(0, fitted)
+
+        result = prefix + flatten(tail_groups)
+        while self._json_size(result) > byte_budget and tail_groups:
+            tail_groups.pop(0)
+            result = prefix + flatten(tail_groups)
+        if self._json_size(result) > byte_budget and prefix_items:
+            prefix = [marker]
+            result = prefix + flatten(tail_groups)
+        if self._json_size(result) > byte_budget:
+            result = [marker]
+        return result, True
+
+    def compact_with_official_api(
+        self,
+        previous_response_id: str | None,
+        input_items: list[dict[str, Any]],
+    ) -> str:
+        """Submit bounded Responses items and retain the opaque window for the next stateless request."""
+        if not input_items:
+            raise RuntimeError("Official compaction requires non-empty input history")
         endpoint = self.model["baseUrl"].rstrip("/") + "/responses/compact"
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.model.get("apiKey"):
             headers["Authorization"] = f"Bearer {self.model['apiKey']}"
         payload: dict[str, Any] = {
             "model": self.model["id"],
+            "request_id": f"resp_compact_client_{uuid.uuid4().hex}",
+            "input": input_items,
             "instructions": (
                 "Preserve the authorized target, verified facts, candidate-method status, failed-method reasons, "
                 "and the next concrete action. Keep opaque compaction state only."
@@ -929,8 +1294,6 @@ class CtfAgent:
         }
         if previous_response_id:
             payload["previous_response_id"] = previous_response_id
-        else:
-            payload["input"] = "\n".join(self.history)
         try:
             response = self.session.post(
                 endpoint,
@@ -946,22 +1309,19 @@ class CtfAgent:
             raise RuntimeError(f"Official compaction request failed with HTTP {response.status_code}: {error_text}")
         try:
             data = response.json()
+            if isinstance(data, dict) and data.get("object") not in (None, "response.compaction"):
+                raise RuntimeError(f"Official compaction returned unexpected object {data.get('object')!r}")
             output = data.get("output") if isinstance(data, dict) else None
-            compaction = next(
-                (
-                    item
-                    for item in output
-                    if isinstance(item, dict)
-                    and item.get("type") == "compaction"
-                    and isinstance(item.get("encrypted_content"), str)
-                    and item["encrypted_content"]
-                ),
-                None,
-            ) if isinstance(output, list) else None
+            if not isinstance(output, list):
+                raise RuntimeError("Official compaction response lacked an output window")
+            prepared_output = self._prepare_official_compaction_output(output)
             artifact_id = str(data.get("id") or "") if isinstance(data, dict) else ""
-            if compaction is None or not artifact_id:
-                raise RuntimeError("Official compaction response lacked an opaque compaction artifact")
+            if not artifact_id:
+                raise RuntimeError("Official compaction response lacked a response id")
+            compaction = next(item for item in prepared_output if item.get("type") == "reasoning" and item.get("encrypted_content"))
             self.last_official_compaction_id = artifact_id
+            self.last_official_compaction_output = prepared_output
+            self.last_official_compaction_encrypted_content = str(compaction["encrypted_content"])
             return artifact_id
         except ValueError as error:
             raise RuntimeError("Official compaction response was not JSON") from error
@@ -988,11 +1348,17 @@ class CtfAgent:
             self.refresh_tui_status()
             return "none"
         if bool(self.settings["useOfficialCompactionApi"]):
+            input_items, input_truncated = self.bounded_compaction_input()
+            self.last_compaction_input_truncated = input_truncated
             self.compaction_status = "官方压缩中"
             self.refresh_tui_status()
-            emit(f"🧹 开始官方 Responses 压缩（本地历史约 {history_tokens:,}/{threshold:,} tokens）…", "info")
+            suffix = "；旧工具项已截断" if input_truncated else ""
+            emit(
+                f"🧹 开始官方 Responses 压缩（{len(input_items)} items，输入上限 {self._compaction_input_token_budget():,} tokens{suffix}）…",
+                "info",
+            )
             try:
-                artifact_id = self.compact_with_official_api(previous_response_id)
+                artifact_id = self.compact_with_official_api(previous_response_id, input_items)
             except RuntimeError as error:
                 self.compaction_status = "官方压缩失败"
                 self.refresh_tui_status()
@@ -1001,7 +1367,7 @@ class CtfAgent:
                 return "none"
             self.compaction_status = "官方压缩完成"
             self.refresh_tui_status()
-            emit(f"✅ 官方 Responses 压缩完成：{artifact_id}；保留原 response 链，绝不把 resp_compact id 直接作为 previous_response_id。", "info")
+            emit(f"✅ 官方 Responses 压缩完成：{artifact_id}；下一轮将以压缩窗口作为完整 input（不复用 compaction response ID）。", "info")
             return "official"
         self.compaction_status = "本地压缩中"
         self.refresh_tui_status()
@@ -1106,7 +1472,7 @@ class CtfAgent:
         maximum = max(1, int(self.settings["maxVirtualFiles"]))
         visible = files[:maximum]
         return {
-            "workspace": ".",
+            "workspace": "/",
             "files": [
                 {"path": self.virtual_relative_path(path), "bytes": path.stat().st_size}
                 for path in visible
@@ -1158,7 +1524,7 @@ class CtfAgent:
                 return {"error": "content must be a string"}
             if not isinstance(append, bool):
                 return {"error": "append must be a boolean"}
-            payload = content.encode("utf-8")
+            payload = self._encode_utf8_text(content, "content")
             maximum_write = max(1, int(self.settings["maxVirtualFileWriteBytes"]))
             if len(payload) > maximum_write:
                 return {"error": f"content exceeds the {maximum_write}B write limit"}
@@ -1197,8 +1563,8 @@ class CtfAgent:
                     return {"error": "find must not be empty"}
                 if not isinstance(replace_all, bool):
                     return {"error": "replace_all must be a boolean"}
-                find_bytes = find.encode("utf-8")
-                replace_bytes = replace.encode("utf-8")
+                find_bytes = self._encode_utf8_text(find, "find")
+                replace_bytes = self._encode_utf8_text(replace, "replace")
                 matches = source.count(find_bytes)
                 if matches == 0:
                     return {"error": "find text was not present in the file"}
@@ -1230,7 +1596,7 @@ class CtfAgent:
                 return {"error": "replacement must be a string"}
             if expected is not None and not isinstance(expected, str):
                 return {"error": "expected must be a string when supplied"}
-            replacement_bytes = replacement.encode("utf-8")
+            replacement_bytes = self._encode_utf8_text(replacement, "replacement")
             maximum_write = max(1, int(self.settings["maxVirtualFileWriteBytes"]))
             if len(replacement_bytes) > maximum_write:
                 return {"error": f"replacement exceeds the {maximum_write}B write limit"}
@@ -1238,7 +1604,7 @@ class CtfAgent:
                 return {"error": "offset and limit must name an existing byte range"}
             end = offset + limit
             original = source[offset:end]
-            if expected is not None and original != expected.encode("utf-8"):
+            if expected is not None and original != self._encode_utf8_text(expected, "expected"):
                 return {"error": "expected text does not match the selected byte range"}
             final = source[:offset] + replacement_bytes + source[end:]
             self._prepare_virtual_write(path, len(final))
@@ -1347,6 +1713,17 @@ class CtfAgent:
             return {"error": "Unsupported HTTP method"}
         headers = dict(action.get("headers") or {})
         body = action.get("body")
+        body_path = action.get("body_path")
+        if body is not None and body_path is not None:
+            return {"error": "body and body_path are mutually exclusive"}
+        if body_path is not None:
+            try:
+                upload_path = self.virtual_path(body_path)
+                if not upload_path.is_file():
+                    return {"error": f"body_path does not exist: {self.virtual_relative_path(upload_path)}"}
+                body = upload_path.read_bytes()
+            except (OSError, ValueError) as error:
+                return {"error": str(error)}
         if isinstance(body, str) and body and not any(key.lower() == "content-type" for key in headers):
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         response = None
@@ -1377,10 +1754,34 @@ class CtfAgent:
                     close()
 
     def python_tool(self, action: dict[str, Any]) -> dict[str, Any]:
-        code = action.get("code")
-        if not isinstance(code, str) or not code.strip():
-            return {"error": "python requires a non-empty code string"}
-        if len(code.encode("utf-8")) > 65536:
+        has_code = "code" in action
+        has_path = "path" in action
+        if has_code == has_path:
+            return {"error": "python requires exactly one of code or path"}
+
+        source_name = "<inline python>"
+        if has_path:
+            try:
+                script_path = self.virtual_path(action.get("path"))
+                if not script_path.is_file():
+                    return {"error": f"python script does not exist: {self.virtual_relative_path(script_path)}"}
+                code_bytes = script_path.read_bytes()
+                code = code_bytes.decode("utf-8")
+                source_name = self.virtual_relative_path(script_path)
+            except UnicodeDecodeError:
+                return {"error": "python script must be UTF-8 text"}
+            except (OSError, ValueError) as error:
+                return {"error": str(error)}
+        else:
+            code = action.get("code")
+            if not isinstance(code, str) or not code.strip():
+                return {"error": "python requires a non-empty code string"}
+            try:
+                code_bytes = self._encode_utf8_text(code, "python code")
+            except ValueError as error:
+                return {"error": str(error)}
+
+        if len(code_bytes) > 65536:
             return {"error": "python code exceeds the 64 KiB limit"}
         configured_maximum = max(1, int(self.settings.get("maxPythonTimeoutSeconds", 600)))
         configured_default = min(max(1, int(self.settings.get("pythonTimeoutSeconds", 60))), configured_maximum)
@@ -1400,16 +1801,22 @@ class CtfAgent:
         ):
             environment.pop(variable, None)
         environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
         environment["CTF_AGENT_WORKSPACE"] = str(self.workspace)
         capture_limit = max(1, int(self.settings["maxToolCaptureBytes"]))
         inline_limit = max(0, int(self.settings["maxInlineToolResultBytes"]))
         try:
             with tempfile.TemporaryDirectory(prefix="ctf-agent-python-") as directory:
-                stdout_path = Path(directory) / "stdout.bin"
-                stderr_path = Path(directory) / "stderr.bin"
+                temporary_root = Path(directory)
+                source_path = temporary_root / "source.py"
+                runner_path = temporary_root / "runner.py"
+                source_path.write_bytes(code_bytes)
+                runner_path.write_text(PYTHON_WORKSPACE_RUNNER, encoding="utf-8")
+                stdout_path = temporary_root / "stdout.bin"
+                stderr_path = temporary_root / "stderr.bin"
                 with stdout_path.open("wb") as stdout_stream, stderr_path.open("wb") as stderr_stream:
                     process = subprocess.Popen(
-                        [sys.executable, "-I", "-c", code],
+                        [sys.executable, "-I", "-X", "utf8", str(runner_path), str(source_path), source_name],
                         cwd=self.workspace,
                         env=environment,
                         stdout=stdout_stream,
@@ -1428,6 +1835,8 @@ class CtfAgent:
             result = {
                 "exit_code": return_code,
                 "timeout_seconds": timeout_seconds,
+                "cwd": "/",
+                "source": source_name,
                 "stdout_preview": self._decode_result_bytes(stdout[:inline_limit]),
                 "stderr_preview": self._decode_result_bytes(stderr[:inline_limit]),
                 "stdout_bytes": stdout_bytes,
@@ -1446,7 +1855,11 @@ class CtfAgent:
             return None, {"error": "function_call was missing call_id"}
         if call.name not in allowed:
             return None, {"error": f"'{call.name}' is locked in this stage. Available: {', '.join(sorted(allowed))}"}
-        if call.arguments_truncated or len(call.arguments.encode("utf-8")) > int(self.settings["maxToolArgumentBytes"]):
+        try:
+            argument_bytes = self._encode_utf8_text(call.arguments, "function arguments")
+        except ValueError as error:
+            return None, {"error": str(error)}
+        if call.arguments_truncated or len(argument_bytes) > int(self.settings["maxToolArgumentBytes"]):
             return None, {"error": f"function '{call.name}' arguments exceed the {self.settings['maxToolArgumentBytes']}B limit"}
         try:
             arguments = json.loads(call.arguments)
@@ -1517,11 +1930,18 @@ class CtfAgent:
             body = action.get("body")
             if isinstance(body, str) and body:
                 emit(f"    📦 {body[:200]}", "dim")
+            body_path = action.get("body_path")
+            if body_path:
+                emit(f"    📄 body_path={body_path}", "dim")
         elif name == "python":
-            code = str(action.get("code", ""))
-            first = code.strip().splitlines()[0] if code.strip() else ""
             timeout = action.get("timeout_seconds", "default 60s")
-            emit(f"🛠️  python · {len(code.encode('utf-8'))}B · timeout={timeout} · {first[:100]}", "tool")
+            path = action.get("path")
+            if path:
+                emit(f"🛠️  python {path} · timeout={timeout}", "tool")
+            else:
+                code = str(action.get("code", ""))
+                first = code.strip().splitlines()[0] if code.strip() else ""
+                emit(f"🛠️  python · {len(code.encode('utf-8', errors='replace'))}B · timeout={timeout} · {first[:100]}", "tool")
         elif name == "read_tool_result":
             emit(f"🛠️  read_tool_result {action.get('result_id', '')} @ {action.get('offset', 0)} + {action.get('limit', '')}", "tool")
         elif name == "list_files":
@@ -1609,7 +2029,12 @@ class CtfAgent:
         self.history = []  # fresh context: only carried-over conclusions remain
         self.stage_evidence = []
         self.clear_tool_buffers()
+        self.last_official_compaction_encrypted_content = ""
+        self.last_official_compaction_output = []
         self.last_official_compaction_id = None
+        self.compaction_groups = []
+        self.current_compaction_group = None
+        self.last_compaction_input_truncated = False
         allowed = set(stage_tools)
         remaining = budget
         previous_response_id: str | None = None
@@ -1637,12 +2062,42 @@ class CtfAgent:
             if compaction_mode == "local":
                 previous_response_id = None
                 continuation_input = None
+                self.compaction_groups = []
+                self.current_compaction_group = None
+            elif (
+                compaction_mode == "official"
+                and self.last_official_compaction_id
+                and self.last_official_compaction_output
+            ):
+                # The compact response ID is an artifact, not a retrievable Responses chain node.
+                # Continue statelessly with its opaque reasoning item in the full input window.
+                previous_response_id = None
+                self.compaction_groups = []
+                self.current_compaction_group = None
+                continuation_input = [dict(item) for item in self.last_official_compaction_output]
+                continuation_input.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": self.build_prompt(
+                                    task,
+                                    include_history=False,
+                                ) + "\nContinue from the official Responses compaction window and issue the next native tool call.",
+                            }
+                        ],
+                    }
+                )
             if continuation_input is None:
                 input_data: str | list[dict[str, Any]] = [
                     {"role": "user", "content": [{"type": "input_text", "text": self.build_prompt(task)}]}
                 ]
+                self.begin_compaction_input(input_data)
             else:
                 input_data = continuation_input
+                if any(isinstance(item, dict) and item.get("role") == "user" for item in continuation_input):
+                    self.begin_compaction_input(continuation_input)
 
             self.current_tool = "模型请求"
             self.refresh_tui_status()
@@ -1653,6 +2108,7 @@ class CtfAgent:
                     tools=stage_tools,
                     previous_response_id=previous_response_id,
                 )
+                self.append_compaction_response(turn)
                 self.current_tool = f"收到 {len(turn.function_calls)} 个调用"
                 self.refresh_tui_status()
             except RuntimeError as error:
@@ -1760,6 +2216,7 @@ class CtfAgent:
                     self.history.append(f"Step {step} action: {json.dumps(action, ensure_ascii=True)}")
                 serialized_result = self.serialize_tool_result(result)
                 self.history.append(self.history_entry(f"Step {step} result: {serialized_result}"))
+                self.append_compaction_output(call.call_id, serialized_result)
                 self.last_result_summary = (
                     str(result.get("error") or result.get("flag") or result.get("method_failure") or json.dumps(result, ensure_ascii=False))[:100]
                 )
@@ -1795,19 +2252,35 @@ class CtfAgent:
 
     def record_method_outcome(self, index: int, outcome: dict[str, Any]) -> None:
         entry = self.globals["methods"][index - 1]
-        if "method_failure" in outcome:
-            entry["status"] = "failed"
-            entry["summary"] = str(outcome["method_failure"])[:160]
-            emit(f"📒 手段 {index} 未成立，继续下一个候选：{entry['summary']}", "dim")
-            return
-        # Budget exhausted: compress this stage's transcript into the method's summary.
-        summary = self.summarize(
-            "\n".join(self.history),
-            f"what was tried for method '{entry['name'][:80]}' and what the target responded",
+        declared_reason = " ".join(str(outcome.get("method_failure") or "").split())[:240]
+        if declared_reason:
+            status = "failed"
+            fallback = "Declared failure: " + declared_reason
+        else:
+            status = "exhausted"
+            fallback = "Execution action budget exhausted before this method was verified."
+        entry["status"] = status
+        self.current_tool = "模型汇总失败证据"
+        self.last_result_summary = f"正在汇总手段 {index} 的失败原因"
+        self.refresh_tui_status()
+        token_budget = self.summary_input_token_budget()
+        emit(f"🧠 正在用模型汇总手段 {index} 的失败证据（工具历史上限 {token_budget:,} tokens）…", "info")
+        what = (
+            f"failed execution method '{str(entry['name'])[:160]}'. Produce a factual handoff for the next candidate: "
+            "observed evidence, exact attempt sequence, why this method failed or remained unverified, "
+            "and paths that must not be repeated. "
+            + (f"Declared reason: {declared_reason}." if declared_reason else "")
         )
-        entry["status"] = "exhausted"
-        entry["summary"] = (summary or "预算耗尽，无结论")[:300]
-        emit(f"📒 手段 {index} 预算耗尽，结论已压缩进全局。", "dim")
+        evidence_summary = self.summarize("\n".join(self.history), what)
+        parts = [fallback]
+        if evidence_summary:
+            parts.append("Evidence summary: " + evidence_summary)
+        summary_limit = max(160, int(self.settings.get("maxMethodSummaryChars", 600)))
+        entry["summary"] = " ".join(parts)[:summary_limit]
+        self.current_tool = "失败总结已保存"
+        self.last_result_summary = entry["summary"][:100]
+        self.refresh_tui_status()
+        emit(f"📒 手段 {index} [{status}] 总结已写入下一执行阶段：{entry['summary']}", "dim")
 
     # ------------------------------------------------------------------ run
 
@@ -1865,6 +2338,7 @@ class CtfAgent:
         # Stage 3 — test each method in its own fresh context; finish unlocked here.
         for index, method in enumerate(methods, 1):
             self.current_method = index
+            self.show_prior_method_outcomes(index)
             outcome = self.run_stage(
                 f"⚔️ 阶段 3/3 · 测试手段 {index}/{len(methods)}",
                 EXECUTE_SYSTEM,

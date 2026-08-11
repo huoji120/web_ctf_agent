@@ -15,6 +15,7 @@ agent:
   methodBudget: 128
   maxMethods: 5
   compactTokens: 64000
+  maxCompactionInputTokens: 8192
   useOfficialCompactionApi: false
   httpTimeoutSeconds: 60
   modelTimeoutSeconds: 900
@@ -30,8 +31,8 @@ agent:
   maxTuiChars: 24000
   pythonTimeoutSeconds: 60
   maxPythonTimeoutSeconds: 600
-  # Per-task workspace root, created below the process's current directory.
-  # Python runs in its session subdirectory; files persist across stages.
+  # Per-task workspace root, created below the process current directory.
+  # Models address files through virtual POSIX root /; Python starts there.
   virtualWorkspaceDir: virtual_files
   maxVirtualFileBytes: 8388608
   maxVirtualFileReadBytes: 32768
